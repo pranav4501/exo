@@ -26,4 +26,6 @@ model_base_shards = {
   "deepseek-coder-v2-lite": {"MLXDynamicShardInferenceEngine": Shard(model_id="mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx", start_layer=0, end_layer=0, n_layers=27),},
   ### llava
   "llava-1.5-7b-hf": {"MLXDynamicShardInferenceEngine": Shard(model_id="llava-hf/llava-1.5-7b-hf", start_layer=0, end_layer=0, n_layers=32),},
+  #stable diffusion
+  "stable-diffusion-2-1-base": {"MLXDynamicShardInferenceEngine": Shard(model_id="stabilityai/stable-diffusion-2-1-base", start_layer=0, end_layer=0, n_layers=37),},
 }

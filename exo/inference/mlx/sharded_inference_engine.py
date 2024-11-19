@@ -13,7 +13,7 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     self.shard = None
     self.shard_downloader = shard_downloader
 
-  async def infer_prompt(self, request_id: str, shard: Shard, prompt: str, image_str: Optional[str] = None, inference_state: Optional[str] = None) -> (np.ndarray, str, bool):
+  async def infer_prompt(self, request_id: str, shard: Shard, prompt: str, image_str: Optional[str] = None, inference_state: Optional[dict] = None) -> (np.ndarray, dict, bool):
     await self.ensure_shard(shard)
     if image_str:
       image = await get_image_from_str(image_str)
@@ -22,13 +22,15 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
       input_ids = mx.array(inputs["input_ids"])
       output_data: np.ndarray = np.array(self.stateful_sharded_model.step(request_id, input_ids, pixel_values))
     else:
-      output_data: np.ndarray = np.array(self.stateful_sharded_model.step(request_id, mx.array(self.tokenizer.encode(prompt))))
-    return output_data, "", output_data.size == 1 and output_data.item() == self.tokenizer.eos_token_id
+      output_data,inference_state = self.stateful_sharded_model.step(request_id, mx.array(self.tokenizer.encode(prompt)), inference_state=inference_state)
+      output_data = np.array(output_data)
+    return output_data, inference_state, inference_state.get('is_finished', False) or (output_data.size == 1 and output_data.item() == self.tokenizer.eos_token_id)
 
-  async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray, inference_state: Optional[str] = None) -> (np.ndarray, str, bool):
+  async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray, inference_state: Optional[dict] = None) -> (np.ndarray, dict, bool):
     await self.ensure_shard(shard)
-    output_data: np.ndarray = np.array(self.stateful_sharded_model.step(request_id, mx.array(input_data)))
-    return output_data, "", output_data.size == 1 and output_data.item() == self.tokenizer.eos_token_id
+    output_data,inference_state = self.stateful_sharded_model.step(request_id, mx.array(input_data), inference_state=inference_state)
+    output_data = np.array(output_data)
+    return output_data, inference_state, inference_state.get('is_finished') or output_data.size == 1 and output_data.item() == self.tokenizer.eos_token_id
 
   async def ensure_shard(self, shard: Shard):
     if self.shard == shard:

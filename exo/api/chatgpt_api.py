@@ -15,6 +15,9 @@ from exo.inference.tokenizers import resolve_tokenizer
 from exo.orchestration import Node
 from exo.models import model_base_shards
 from typing import Callable
+from PIL import Image
+import numpy as np
+
 
 
 class Message:
@@ -153,7 +156,7 @@ class PromptSession:
 
 
 class ChatGPTAPI:
-  def __init__(self, node: Node, inference_engine_classname: str, response_timeout_secs: int = 90, on_chat_completion_request: Callable[[str, ChatCompletionRequest, str], None] = None):
+  def __init__(self, node: Node, inference_engine_classname: str, response_timeout_secs: int = 900, on_chat_completion_request: Callable[[str, ChatCompletionRequest, str], None] = None):
     self.node = node
     self.inference_engine_classname = inference_engine_classname
     self.response_timeout_secs = response_timeout_secs
@@ -171,9 +174,12 @@ class ChatGPTAPI:
     )
     cors.add(self.app.router.add_post("/v1/chat/completions", self.handle_post_chat_completions), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/chat/token/encode", self.handle_post_chat_token_encode), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/images/generations", self.handle_post_image_generations), {"*": cors_options})
+
     self.static_dir = Path(__file__).parent.parent.parent/"tinychat/examples/tinychat"
     self.app.router.add_get("/", self.handle_root)
     self.app.router.add_static("/", self.static_dir, name="static")
+    self.app.router.add_static('/images/', self.static_dir / 'images', name='static_images')
 
     # Add middleware to log every request
     self.app.middlewares.append(self.log_request)
@@ -324,6 +330,74 @@ class ChatGPTAPI:
     finally:
       deregistered_callback = self.node.on_token.deregister(callback_id)
       if DEBUG >= 2: print(f"Deregister {callback_id=} {deregistered_callback=}")
+  
+
+  async def handle_post_image_generations(self, request):
+    data = await request.json()
+
+    # Extract the necessary parameters from the request data
+    model = data.get("model", "")
+    prompt = data.get("prompt", "")
+    shard = model_base_shards[model].get(self.inference_engine_classname, None)
+    if not shard:
+        return web.json_response({"error": f"Unsupported model: {model} with inference engine {self.inference_engine_classname}"}, status=400)
+
+    request_id = str(uuid.uuid4())
+    callback_id = f"chatgpt-api-wait-response-{request_id}"
+    callback = self.node.on_token.register(callback_id)
+
+    try:
+        await self.node.process_prompt(shard, prompt, request_id=request_id)
+
+        response = web.StreamResponse(status=200, reason='OK', headers={'Content-Type': 'application/octet-stream',"Cache-Control": "no-cache",})
+        await response.prepare(request)
+
+        def get_progress_bar(current_step, total_steps, bar_length=50):
+          # Calculate the percentage of completion
+          percent = float(current_step) / total_steps
+          # Calculate the number of hashes to display
+          arrow = '-' * int(round(percent * bar_length) - 1) + '>'
+          spaces = ' ' * (bar_length - len(arrow))
+          
+          # Create the progress bar string
+          progress_bar = f'Progress: [{arrow}{spaces}] {int(percent * 100)}% ({current_step}/{total_steps})'
+          return progress_bar
+
+        async def stream_image(_request_id: str, result, is_finished: bool):
+            if isinstance(result, list):
+                await response.write(json.dumps({'progress': get_progress_bar((result[0]), (result[1]))}).encode('utf-8') + b'\n')
+
+            elif isinstance(result, np.ndarray):
+              im = Image.fromarray(np.array(result))
+              # Save the image to a file
+              image_filename = f"{_request_id}.png"
+              image_path = self.static_dir / "images" / image_filename
+              im.save(image_path)
+              
+              image_url = request.app.router['static_images'].url_for(filename=image_filename)
+              full_image_url = str(request.url.with_path(image_url.path))  # Construct full URL # Construct full URL
+              await response.write(json.dumps({'images': [{'url': str(full_image_url), 'content_type': 'image/png'}]}).encode('utf-8') + b'\n')
+
+              await response.write_eof()
+                
+
+        stream_task = None
+        def on_result(_request_id: str, result, is_finished: bool):
+            nonlocal stream_task
+            stream_task = asyncio.create_task(stream_image(_request_id, result, is_finished))
+            return _request_id == request_id and is_finished
+
+        await callback.wait(on_result, timeout=self.response_timeout_secs*10)
+        
+        if stream_task:
+            # Wait for the stream task to complete before returning
+            await stream_task
+
+        return response
+
+    except Exception as e:
+        if DEBUG >= 2: traceback.print_exc()
+        return web.json_response({"detail": f"Error processing prompt (see logs with DEBUG>=2): {str(e)}"}, status=500)
 
   async def run(self, host: str = "0.0.0.0", port: int = 8000):
     runner = web.AppRunner(self.app)

@@ -45,6 +45,7 @@
         <option value="mistral-large">Mistral Large</option>
         <option value="deepseek-coder-v2-lite">Deepseek Coder V2 Lite</option>
         <option value="llava-1.5-7b-hf">LLaVa 1.5 7B (Vision Model)</option>
+        <option value="stable-diffusion-2-1-base">Stable Diffusion 2.1</option>
       </select>
     </div>
     <div class="home centered" x-show="home === 0" x-transition x-effect="
@@ -107,7 +108,15 @@
           const div = document.createElement('div');
           div.className = `message message-role-${role}`;
           try {
-            div.innerHTML = DOMPurify.sanitize(marked.parse(content));
+            if (content.includes('![Generated Image]')) {
+              const imageUrl = content.match(/\((.*?)\)/)[1];
+              const img = document.createElement('img');
+              img.src = imageUrl;
+              img.alt = 'Generated Image';
+              div.appendChild(img);
+            } else {
+              div.innerHTML = DOMPurify.sanitize(marked.parse(content));
+            }
           } catch (e) {
             console.log(content);
             console.error(e);

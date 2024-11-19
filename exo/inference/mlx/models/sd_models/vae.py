@@ -1,4 +1,4 @@
-# Copyright © 2023 Apple Inc.
+# Adapted from https://github.com/ml-explore/mlx-examples/blob/main/stable_diffusion/stable_diffusion/vae.py
 
 import math
 from typing import List
@@ -6,13 +6,43 @@ from typing import List
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import AutoencoderConfig
 from .unet import ResnetBlock2D, upsample_nearest
 from dataclasses import dataclass, field
 from exo.inference.shard import Shard
 from typing import Tuple
 import inspect
 from ..base import IdentityBlock
+
+@dataclass
+class AutoencoderConfig:
+    in_channels: int = 3
+    out_channels: int = 3
+    latent_channels_out: int = 8
+    latent_channels_in: int = 4
+    block_out_channels: Tuple[int] = (128, 256, 512, 512)
+    layers_per_block: int = 2
+    norm_num_groups: int = 32
+    scaling_factor: float = 0.18215
+    weight_files: List[str] = field(default_factory=lambda: [])
+    @classmethod
+    def from_dict(cls, params):
+        return cls(**{k: v for k, v in params.items() if k in inspect.signature(cls).parameters})
+
+
+@dataclass
+class ModelArgs(AutoencoderConfig):
+    shard: Shard = field(default_factory=lambda: Shard("", 0, 0, 0))
+
+    def __post_init__(self):
+        if isinstance(self.shard, dict):
+            self.shard = Shard(**self.shard)
+
+        if not isinstance(self.shard, Shard):
+            raise TypeError(f"Expected shard to be a Shard instance or a dict, got {type(self.shard)} instead")
+
+        if not self.shard.is_first_layer():
+            self.vision_config = None
+
 
 class Attention(nn.Module):
     """A single head unmasked attention for use with the VAE."""
@@ -83,14 +113,12 @@ class EncoderDecoderBlock2D(nn.Module):
     def __call__(self, x):
         for resnet in self.resnets:
             x = resnet(x)
-
         if "downsample" in self:
             x = mx.pad(x, [(0, 0), (0, 1), (0, 1), (0, 0)])
             x = self.downsample(x)
 
         if "upsample" in self:
             x = self.upsample(upsample_nearest(x))
-
         return x
 
 
@@ -175,7 +203,6 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         self.out_channels = out_channels
-        print(f"Decoder layer range: {layer_range}")
         self.layers_range = layer_range
         if 0 in layer_range:
             self.conv_in = nn.Conv2d(
@@ -204,7 +231,6 @@ class Decoder(nn.Module):
         current_layer = 1
 
         for i, (in_channels, out_channels) in enumerate(zip(channels, channels[1:])):
-            print(in_channels, out_channels)
             if current_layer in layer_range:
                 self.up_blocks.append(
                     EncoderDecoderBlock2D(
@@ -232,6 +258,7 @@ class Decoder(nn.Module):
             x = self.mid_blocks[0](x)
             x = self.mid_blocks[1](x)
             x = self.mid_blocks[2](x)
+        
         for l in self.up_blocks:
             x = l(x)
         if 4 in self.layers_range:
@@ -273,10 +300,10 @@ class Autoencoder(nn.Module):
             config.layers_per_block + 1,
             resnet_groups=config.norm_num_groups,
         )
-
-        self.post_quant_proj = nn.Conv2d(
-            4,4,1
-        )
+        if 0 in self.layers_range:
+            self.post_quant_proj = nn.Linear(
+                config.latent_channels_in, config.latent_channels_in
+            )
 
     def decode(self, z):
         if 0 in self.layers_range:
@@ -304,131 +331,60 @@ class Autoencoder(nn.Module):
         layers = self.layers_range
         sanitized_weights = {}
         for key, value in weights.items():
-            # Map encoder layers
-            flag=0
-            if((('encoder' in key) and not self.decoder_only) or 'decoder' in key):
-                if "conv_in" in key and 0 in layers:
-                    flag=1
-                if "mid.block_1" in key and 0 in layers:
-                    key = key.replace("mid.block_1", "mid_blocks.0")
-                    flag=1
-                if "mid.block_2" in key and 0 in layers:
-                    key = key.replace("mid.block_2", "mid_blocks.2")
-                    flag=1
-                if "mid.attn_1.k" in key and 0 in layers:
-                    key = key.replace("mid.attn_1.k", "mid_blocks.1.key_proj")
-                    flag=1
-                if "mid.attn_1.q" in key and 0 in layers:
-                    key = key.replace("mid.attn_1.q", "mid_blocks.1.query_proj")
-                    flag=1
-                if "mid.attn_1.v" in key and 0 in layers:
-                    key = key.replace("mid.attn_1.v", "mid_blocks.1.value_proj")
-                    flag=1
-                if "mid.attn_1.proj_out" in key and 0 in layers:
-                    key = key.replace("mid.attn_1.proj_out", "mid_blocks.1.out_proj")
-                    flag=1
-                if "mid.attn_1.norm" in key and 0 in layers:
-                    key = key.replace("mid.attn_1.norm", "mid_blocks.1.group_norm")
-                    flag=1
-                
-                if "up.0.block" in key and 4 in layers:
-                    key = key.replace("up.0.block", "up_blocks.3.resnets")
-                    flag=1
-                if "up.1.block" in key and 3 in layers:
-                    key = key.replace("up.1.block", "up_blocks.2.resnets")
-                    flag=1
-                if "up.2.block" in key and 2 in layers:
-                    key = key.replace("up.2.block", "up_blocks.1.resnets")
-                    flag=1
-                if "up.3.block" in key and 1 in layers:
-                    key = key.replace("up.3.block", "up_blocks.0.resnets")
-                    flag=1
+            if 'decoder' in key and self.decoder_only:
+                if "downsamplers" in key:
+                    key = key.replace("downsamplers.0.conv", "downsample")
+                if "upsamplers" in key:
+                    key = key.replace("upsamplers.0.conv", "upsample")
 
-                if "up.0.upsample.conv" in key and 4 in layers:
-                    key = key.replace("up.0.upsample.conv", "up_blocks.3.upsample")
-                    flag=1
-                if "up.1.upsample.conv" in key and 3 in layers:
-                    key = key.replace("up.1.upsample.conv", "up_blocks.2.upsample")
-                    flag=1
-                if "up.2.upsample.conv" in key and 2 in layers:
-                    key = key.replace("up.2.upsample.conv", "up_blocks.1.upsample")
-                    flag=1
-                if "up.3.upsample.conv" in key and 1 in layers:
-                    key = key.replace("up.3.upsample.conv", "up_blocks.0.upsample")
-                    flag=1
-                if "norm_out" in key and 4 in layers:
-                    key = key.replace("norm_out", "conv_norm_out")
-                    flag=1
-                if 'conv_out' in key and 4 in layers:
-                    flag=1
+                # Map attention layers
+                if "key" in key:
+                    key = key.replace("key", "key_proj")
+                if "proj_attn" in key:
+                    key = key.replace("proj_attn", "out_proj")
+                if "query" in key:
+                    key = key.replace("query", "query_proj")
+                if "value" in key:
+                    key = key.replace("value", "value_proj")
 
-                if "nin_shortcut" in key:
-                    key = key.replace("nin_shortcut", "conv_shortcut")
-                
-                
-                if "down.0.block." in key:
-                    key = key.replace("down.0.block.", "down_blocks.0.resnets.")                
-                if "down.1.block." in key:
-                    key = key.replace("down.1.block.", "down_blocks.1.resnets.")
-                if "down.2.block." in key:
-                    key = key.replace("down.2.block.", "down_blocks.2.resnets.")
-                if "down.3.block." in key:
-                    key = key.replace("down.3.block.", "down_blocks.3.resnets.")
-
-                if "down.0.downsample.conv" in key:
-                    key = key.replace("down.0.downsample.conv", "down_blocks.0.downsample")
-                if "down.1.downsample.conv" in key:
-                    key = key.replace("down.1.downsample.conv", "down_blocks.1.downsample")
-                if "down.2.downsample.conv" in key:
-                    key = key.replace("down.2.downsample.conv", "down_blocks.2.downsample")
-                
-                
-                
+                # Map the mid block
+                if "mid_block.resnets.0" in key:
+                    key = key.replace("mid_block.resnets.0", "mid_blocks.0")
+                if "mid_block.attentions.0" in key:
+                    key = key.replace("mid_block.attentions.0", "mid_blocks.1")
+                if "mid_block.resnets.1" in key:
+                    key = key.replace("mid_block.resnets.1", "mid_blocks.2")
+        
+                # Map the quant/post_quant layers
+                if "quant_conv" in key:
+                    key = key.replace("quant_conv", "quant_proj")
+                    value = value.squeeze()
+                    
+                # Map the conv_shortcut to linear
                 if "conv_shortcut.weight" in key:
                     value = value.squeeze()
 
-                if len(value.shape) == 4 and "query_proj" not in key:
-                    value = value.transpose(0, 2, 3, 1)
-                    value = value.reshape(-1).reshape(value.shape)
-                if "query_proj" or "key_proj" or "value_proj" or "out_proj" in key:
-                    value = value.squeeze()
-                if flag==1:
-                    sanitized_weights[key] = value
-            if "post_quant_conv" in key or ("quant_conv" in key and not self.decoder_only):
-                key = key.replace("quant_conv", "quant_proj")
                 if len(value.shape) == 4:
                     value = value.transpose(0, 2, 3, 1)
                     value = value.reshape(-1).reshape(value.shape)
-                    
+
+                if key.startswith("decoder.mid_blocks."):
+                    if 0 in layers:
+                        sanitized_weights[key] = value
+                if "conv_in" in key and 0 in layers:
+                    sanitized_weights[key] = value
+                if key.startswith("decoder.up_blocks."):
+                    layer_num = int(key.split(".")[2])+1
+                    if layer_num in layers:
+                        sanitized_weights[key] = value
+                if key.startswith("decoder.conv_norm_out") and 4 in layers:
+                    sanitized_weights[key] = value
+                if key.startswith("decoder.conv_out") and 4 in layers:
+                    sanitized_weights[key] = value
+                
+            if "post_quant_conv" in key and 0 in layers:
+                key = key.replace("quant_conv", "quant_proj")
+                value = value.squeeze()
                 sanitized_weights[key] = value
         return sanitized_weights
 
-@dataclass
-class AutoencoderConfig:
-    in_channels: int = 3
-    out_channels: int = 3
-    latent_channels_out: int = 8
-    latent_channels_in: int = 4
-    block_out_channels: Tuple[int] = (128, 256, 512, 512)
-    layers_per_block: int = 2
-    norm_num_groups: int = 32
-    scaling_factor: float = 0.18215
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(**{k: v for k, v in params.items() if k in inspect.signature(cls).parameters})
-
-
-@dataclass
-class ModelArgs(AutoencoderConfig):
-    shard: Shard = field(default_factory=lambda: Shard("", 0, 0, 0))
-
-    def __post_init__(self):
-        if isinstance(self.shard, dict):
-            self.shard = Shard(**self.shard)
-
-        if not isinstance(self.shard, Shard):
-            raise TypeError(f"Expected shard to be a Shard instance or a dict, got {type(self.shard)} instead")
-
-        if not self.shard.is_first_layer():
-            self.vision_config = None

@@ -133,16 +133,30 @@ class StandardNode(Node):
       if DEBUG >= 2: print(f"[{request_id}] forwarding to next shard: {base_shard=} {shard=} {prompt=} {image_str=}")
       await self.forward_to_next_shard(shard, prompt, request_id, image_str=image_str, inference_state=inference_state)
       return
-
+    if shard.model_id == 'stabilityai/stable-diffusion-2-1-base':
+      inference_state = {'step':0}
+    else:
+      inference_state = {}
     result, inference_state, is_finished = await self.inference_engine.infer_prompt(request_id, shard, prompt, image_str, inference_state=inference_state)
     is_finished = is_finished or len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens
     if is_finished:
       self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
-    asyncio.create_task(self.broadcast_result(request_id, self.buffered_token_output[request_id][0], is_finished))  # TODO: this is n^2 communication complexity
 
-    if result.size == 1:
-      self.buffered_token_output[request_id][0].append(result.item())
-      self.trigger_on_token_callbacks(request_id, self.buffered_token_output[request_id][0], is_finished)
+    if shard.model_id != 'stabilityai/stable-diffusion-2-1-base':
+      if is_finished:
+        self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
+      intermediate_result = self.buffered_token_output[request_id][0]
+    else:
+      intermediate_result, inference_state = self.handle_stable_diffusion(inference_state, result)
+
+    asyncio.create_task(self.broadcast_result(request_id, intermediate_result, is_finished))  # TODO: this is n^2 communication complexity
+
+    if shard.model_id != 'stabilityai/stable-diffusion-2-1-base':
+      if result.size == 1:
+        self.buffered_token_output[request_id][0].append(result.item())
+        self.trigger_on_token_callbacks(request_id, self.buffered_token_output[request_id][0], is_finished)
+    else:
+      self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
 
     if DEBUG >= 2: print(f"[{request_id}] result size: {result.size}, is finished: {is_finished}, buffered tokens: {len(self.buffered_token_output[request_id][0])}")
 
@@ -171,7 +185,6 @@ class StandardNode(Node):
           "tensor_size": tensor.size,
           "tensor_shape": tensor.shape,
           "request_id": request_id,
-          "inference_state": inference_state,
         }),
       )
     )
@@ -213,13 +226,24 @@ class StandardNode(Node):
       if DEBUG >= 1: print(f"[{request_id}] process_tensor: {tensor.size=} {tensor.shape=}")
       result, inference_state, is_finished = await self.inference_engine.infer_tensor(request_id, shard, tensor, inference_state=inference_state)
       is_finished = is_finished or len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens
-      if is_finished:
-        self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
-      asyncio.create_task(self.broadcast_result(request_id, self.buffered_token_output[request_id][0], is_finished))  # TODO: this is n^2 communication complexity
+      
+      if shard.model_id != 'stabilityai/stable-diffusion-2-1-base':
+        if is_finished:
+          self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
+        intermediate_result = self.buffered_token_output[request_id][0]
+      else:
+        intermediate_result, inference_state = self.handle_stable_diffusion(inference_state, result)
 
-      if result.size == 1:  # we got a new token out
-        self.buffered_token_output[request_id][0].append(result.item())
-        self.trigger_on_token_callbacks(request_id, self.buffered_token_output[request_id][0], is_finished)
+      asyncio.create_task(self.broadcast_result(request_id, intermediate_result, is_finished))  # TODO: this is n^2 communication complexity
+
+      if shard.model_id != 'stabilityai/stable-diffusion-2-1-base':
+        if result.size == 1:
+          self.buffered_token_output[request_id][0].append(result.item())
+          self.trigger_on_token_callbacks(request_id, self.buffered_token_output[request_id][0], is_finished)
+      else:
+        self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
+
+
       if DEBUG >= 2: print(f"[{request_id}] result size: {result.size}, is finished: {is_finished}, buffered tokens: {len(self.buffered_token_output[request_id][0])}")
 
       if not is_finished:
@@ -353,7 +377,7 @@ class StandardNode(Node):
   async def broadcast_result(self, request_id: str, result: List[int], is_finished: bool) -> None:
     async def send_result_to_peer(peer):
       try:
-        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=15.0)
+        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=20.0)
       except asyncio.TimeoutError:
         print(f"Timeout broadcasting result to {peer.id()}")
       except Exception as e:
@@ -367,7 +391,7 @@ class StandardNode(Node):
 
     async def send_status_to_peer(peer):
       try:
-        await asyncio.wait_for(peer.send_opaque_status(request_id, status), timeout=15.0)
+        await asyncio.wait_for(peer.send_opaque_status(request_id, status), timeout=20.0)
       except asyncio.TimeoutError:
         print(f"Timeout sending opaque status to {peer.id()}")
       except Exception as e:
@@ -381,3 +405,12 @@ class StandardNode(Node):
   @property
   def current_topology(self) -> Topology:
     return self.topology
+
+  def handle_stable_diffusion(self, inference_state, result):
+    if inference_state['is_step_finished']:
+      inference_state['step']+=1
+    progress = [inference_state['step'],inference_state['total_steps']]
+    intermediate_result = progress
+    if progress[0] == progress[1]:
+      intermediate_result = result
+    return intermediate_result, inference_state

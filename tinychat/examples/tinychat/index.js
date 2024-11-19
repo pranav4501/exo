@@ -103,6 +103,60 @@ document.addEventListener("alpine:init", () => {
           };
         }
       });
+      if (this.cstate.selectedModel === "stable-diffusion-2-1-base") {
+        // Send a request to the image generation endpoint
+        console.log(apiMessages[apiMessages.length - 1].content)
+        console.log(this.cstate.selectedModel)  
+        const response = await fetch(`${this.endpoint}/images/generations`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            "model": 'stable-diffusion-2-1-base',
+            "prompt": apiMessages[apiMessages.length - 1].content,
+            "num_images": 1,
+            "size": "512x512",
+          }),
+        });
+    
+        if (!response.ok) {
+          throw new Error("Failed to fetch");
+        }
+        const reader = response.body.getReader();
+        let result = "";
+        let done = false;
+
+        let imageChunks = [];
+        let gottenFirstChunk = false;
+
+        while (!done) {
+          const { value, done: readerDone } = await reader.read();
+          done = readerDone;
+          const decoder = new TextDecoder();
+
+          if (value) {
+            // Assume non-binary data (text) comes first
+            const chunk = decoder.decode(value, { stream: true });
+            const parsed = JSON.parse(chunk);
+            console.log(parsed)
+
+            if (parsed.progress) {
+              if (!gottenFirstChunk) {
+                this.cstate.messages.push({ role: "assistant", content: "" });
+                gottenFirstChunk = true;
+              }
+              this.cstate.messages[this.cstate.messages.length - 1].content = parsed.progress;
+            }
+            else if (parsed.images) {
+              const imageUrl = parsed.images[0].url;
+              this.cstate.messages[this.cstate.messages.length - 1].content = `![Generated Image](${imageUrl})`;
+            }
+        }
+      }
+        
+      }
+      else{
       const containsImage = apiMessages.some(msg => Array.isArray(msg.content) && msg.content.some(item => item.type === 'image_url'));
       if (containsImage) {
         // Map all messages with string content to object with type text
@@ -149,6 +203,7 @@ document.addEventListener("alpine:init", () => {
           }
         }
       }
+    }
 
       // Clean the cstate before adding it to histories
       const cleanedCstate = JSON.parse(JSON.stringify(this.cstate));

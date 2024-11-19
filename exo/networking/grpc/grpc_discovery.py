@@ -32,7 +32,7 @@ class GRPCDiscovery(Discovery):
     broadcast_port: int = None,
     broadcast_interval: int = 1,
     device_capabilities: DeviceCapabilities = UNKNOWN_DEVICE_CAPABILITIES,
-    discovery_timeout: int = 30,
+    discovery_timeout: int = 60,
   ):
     self.node_id = node_id
     self.node_port = node_port

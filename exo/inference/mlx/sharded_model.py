@@ -25,6 +25,7 @@ class StatefulShardedModel:
     temp: float = 0.0,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    inference_state: Optional[dict] = None,
   ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     def sample(logits: mx.array) -> Tuple[mx.array, float]:
       if logit_bias:
@@ -43,25 +44,27 @@ class StatefulShardedModel:
       return token
 
     y = x
+    if self.shard.model_id !='stabilityai/stable-diffusion-2-1-base':
+      if request_id not in self.caches:
+        self.init_cache(request_id)
+      
+      else:
+        self.caches.move_to_end(request_id)
 
-    if request_id not in self.caches:
-      self.init_cache(request_id)
-    else:
-      self.caches.move_to_end(request_id)
+      cache = self.caches[request_id]
 
-    cache = self.caches[request_id]
-
-    if pixel_values is None:
-      output = self.model(y[None] if self.shard.is_first_layer() else y, cache=cache)
-    else:
-      output = self.model(y, pixel_values=pixel_values, cache=cache)
-
+      if pixel_values is None:
+        output = self.model(y[None] if self.shard.is_first_layer() else y, cache=cache)
+      else:
+        output = self.model(y, pixel_values=pixel_values, cache=cache)
+    else: 
+      output, inference_state = self.model(y, **inference_state)
     if self.shard.is_last_layer():
-      logits = output[:, -1, :]
-      y = sample(logits)
-      return y
-    else:
-      return output
+      if self.shard.model_id !='stabilityai/stable-diffusion-2-1-base':
+        logits = output[:, -1, :]
+        y = sample(logits)
+        output = y
+    return output, inference_state
 
   def __call__(
     self,

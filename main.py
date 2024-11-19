@@ -90,7 +90,7 @@ api = ChatGPTAPI(
 )
 node.on_token.register("update_topology_viz").on_next(
   lambda req_id, tokens, __: topology_viz.update_prompt_output(req_id,
-                                                               inference_engine.tokenizer.decode(tokens) if hasattr(inference_engine, "tokenizer") else tokens) if topology_viz else None
+                                                               inference_engine.tokenizer.decode(tokens) if hasattr(inference_engine, "tokenizer") else tokens) if topology_viz and inference_engine.shard.model_id!="stabilityai/stable-diffusion-2-1-base" else None
 )
 
 

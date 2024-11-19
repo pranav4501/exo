@@ -8,7 +8,8 @@ from . import node_service_pb2_grpc
 from exo import DEBUG
 from exo.inference.shard import Shard
 from exo.orchestration import Node
-
+import json
+import mlx.core as mx
 
 class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
   def __init__(self, node: Node, host: str, port: int):
@@ -66,9 +67,10 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     tensor = np.frombuffer(request.tensor.tensor_data, dtype=np.dtype(request.tensor.dtype)).reshape(request.tensor.shape)
     request_id = request.request_id
     inference_state = request.inference_state
+    inference_state = self.deserialize_inference_state(inference_state)
 
     result = await self.node.process_tensor(shard, tensor, request_id, inference_state)
-    if DEBUG >= 5: print(f"SendTensor tensor {shard=} {tensor=} {request_id=} result: {result}")
+    #if DEBUG >= 5: print(f"SendTensor tensor {shard=} {tensor=} {request_id=} result: {result}")
     tensor_data = result.tobytes() if result is not None else None
     return node_service_pb2.Tensor(tensor_data=tensor_data, shape=result.shape, dtype=str(result.dtype)) if result is not None else node_service_pb2.Tensor()
 
@@ -106,7 +108,11 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     request_id = request.request_id
     result = request.result
     is_finished = request.is_finished
-    if DEBUG >= 5: print(f"Received SendResult request: {request_id=} {result=} {is_finished=}")
+    img = request.tensor
+    if DEBUG >= 5: print(f"Received SendResult request: {request_id=} {result=} {is_finished=} ")
+    result = list(result)
+    if len(img.tensor_data) > 0:
+      result=np.frombuffer(img.tensor_data, dtype=np.dtype(img.dtype)).reshape(img.shape)
     self.node.on_token.trigger_all(request_id, result, is_finished)
     return node_service_pb2.Empty()
 
@@ -116,3 +122,22 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     if DEBUG >= 5: print(f"Received SendOpaqueStatus request: {request_id=} {status=}")
     self.node.on_opaque_status.trigger_all(request_id, status)
     return node_service_pb2.Empty()
+
+  def deserialize_inference_state(self,inference_state_proto: node_service_pb2.InferenceState) -> dict:
+    inference_state = {}
+    
+    for k, tensor_data in inference_state_proto.tensor_data.items():
+        np_array = np.frombuffer(tensor_data.tensor_data, dtype=tensor_data.dtype).reshape(tensor_data.shape)
+        inference_state[k] = mx.array(np_array)
+    
+    for k, tensor_list in inference_state_proto.tensor_list_data.items():
+        inference_state[k] = [
+            mx.array(np.frombuffer(tensor.tensor_data, dtype=tensor.dtype).reshape(tensor.shape))
+            for tensor in tensor_list.tensors
+        ]
+    
+    if inference_state_proto.other_data_json:
+        other_data = json.loads(inference_state_proto.other_data_json)
+        inference_state.update(other_data)
+    
+    return inference_state
